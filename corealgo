@@ -1,0 +1,194 @@
+import numpy as np
+import math
+import time
+from fractions import Fraction
+from qiskit import QuantumCircuit, transpile, QuantumRegister
+from qiskit_aer import AerSimulator, Aer
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import Sampler
+import os
+from pprint import pprint
+from math import gcd, isqrt
+SWEEP       = False
+IBM_API = os.environ["QISKIT_ENV"] 
+
+# Function to find the greatest common divisor
+def is_prime(n):
+    """Check if a number is prime using trial division."""
+    if n < 2:
+        return False
+    for i in range(2, isqrt(n) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+def gcd(a, b):
+    while b != 0:
+        a, b = b, a % b
+    return a
+
+def binary_to_decimal(binary_counts):
+    """Convert binary measurement results to decimal."""
+    decimal_counts = {int(binary, 2): count for binary, count in binary_counts.items()}
+    return decimal_counts
+
+#############################################
+# CORE CODES THAT CREATE A QUANTUM CIRCUIT. #
+#############################################
+
+def mod_exp(base, exponent, modulus):
+    return pow(base, exponent, modulus)
+
+def create_quantum_order_circuit(N, a):
+    n_count = int(np.ceil(np.log2(N))) * 2
+    qr = QuantumRegister(n_count + 1, name="q")
+
+    qc = QuantumCircuit(n_count + 1, n_count)
+    for qubit in range(n_count):
+        qc.h(qubit)
+    qc.x(n_count)
+
+    # Modular exponentiation (simplified for IBMQ execution)
+    for qubit in range(n_count):
+        mod_exp_value = pow(a, 2 ** qubit, N)
+        theta = mod_exp_value * (np.pi / 2)
+
+        # Convert phase shift into a custom gate with label
+        phase_gate = QuantumCircuit(1)
+        phase_gate.p(theta, 0)
+        phase_gate = phase_gate.to_gate()
+        phase_gate.label = f"{a}^{2**qubit} mod {N}"  # ✅ Label correctly
+
+        # Apply the labeled phase gate
+        qc.append(phase_gate, [qr[n_count]])
+
+    qc.measure(range(n_count), range(n_count))
+    return qc
+
+##############################################
+
+def find_factors_shor(N, a, counts, top_n=3):
+    """
+    Finds two factors of N using order-finding results from Shor's algorithm.
+    
+    Parameters:
+    - N (int): The composite number to be factored.
+    - a (int): The coprime base used in Shor's algorithm.
+    - counts (dict): Measurement results from a quantum circuit.
+    - top_n (int): Number of top results to consider from measurement counts.
+            
+    Returns:
+    - (factor1, factor2) if valid factors are found.
+    - None if no valid factors are found.
+    """     
+    # Sort counts in descending order and take the top `top_n`
+    top_n_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_n]
+                
+    # Number of counting qubits (assumed from length of keys)
+    n_count = len(next(iter(counts)))
+            
+    # Convert each top measured bitstring to a decimal phase
+    decimal_phases = [(int(bitstring, 2) / (2 ** n_count)) for bitstring, _ in top_n_counts]
+                
+    # Convert to fractions (for finding order `r`)
+    fraction_phases = [Fraction(phase).limit_denominator(N) for phase in decimal_phases]
+                
+    # Extract possible order values `r` (denominators of the fractions) and exclude `r = 1`
+    r_values = [frac.denominator for frac in fraction_phases if frac.denominator != 1]
+     
+    # Try each r value to find valid factors of N
+    for r in r_values:
+        if r % 2 == 0:  # Only consider even r
+            x = pow(a, r // 2, N)  # Compute a^(r/2) mod N
+            factor1 = gcd(x - 1, N)
+            factor2 = gcd(x + 1, N)
+
+            # Check if valid factors are found
+            if factor1 > 1 and factor2 > 1 and factor1 * factor2 == N:
+                #print(f"✅ Found Factors of {N}: {factor1}, {factor2}")
+                return factor1, factor2
+     
+            # If one of the factors is prime and divides N, compute the other factor
+            elif factor1 > 1 and is_prime(factor1) and N % factor1 == 0:
+                factor2 = N // factor1
+                #print(f"✅ Found Factors of {N}: {factor1}, {factor2} (Derived via Division)")
+                return factor1, factor2
+    
+            elif factor2 > 1 and is_prime(factor2) and N % factor2 == 0:
+                factor1 = N // factor2 
+                #print(f"✅ Found Factors of {N}: {factor1}, {factor2} (Derived via Division)")
+                return factor1, factor2
+     
+            else:
+                #print(f"❌ Disqualified factors: ({factor1}, {factor2})")
+                continue
+    #print("❌ No valid factors found from r values.")
+    return None
+
+########
+# MAIN #
+########
+# N = 3*5     # famous 15
+# N = 17*41   # 697
+# N = 61*97   # 5917
+# N = 19*31   # 589 
+# N = 29*83   # 2407
+# N = 43*59   # 2537
+# N = 31*181  # 5611 
+# N = 109*113 # 12317
+# N = 149*109 # 16241   # biggest 5 digit that can run on simulator, max 30qubits
+# N = 3917*97 # 379949  # this 6 digit can be run on QPU but not on simulator
+
+USE_REAL_QC = True
+
+###########
+N = 15
+###########
+
+if USE_REAL_QC:
+    QiskitRuntimeService.save_account(IBM_API, overwrite=True, channel="ibm_quantum")
+    service = QiskitRuntimeService(instance="ibm-q/open/main")
+    available_backends = [backend.name for backend in service.backends()]
+    print("Available Backends:", available_backends)
+    simulator = service.least_busy(simulator=False, operational=True)
+else:
+    simulator = AerSimulator()
+
+print(simulator)
+print(f"{simulator.name} - Qubits MAX: {simulator.configuration().num_qubits}")
+
+count_yes = 0
+count_no = 0
+PRINTED = 1
+for a in range(2, N):
+    n_count = int(np.ceil(np.log2(N))) * 2
+    qc  = create_quantum_order_circuit(N, a)
+    transpiled_qc = transpile(qc, simulator)
+    #print(qc.draw(output='text'))
+
+    if USE_REAL_QC:
+       sampler = Sampler(simulator)
+       job = sampler.run([transpiled_qc],shots=1000)
+       result = job.result()
+       counts = result[0].data.c.get_counts()
+    else:
+       result = simulator.run(transpiled_qc, shots=1000).result()
+       counts = result.get_counts()
+    
+    top_n = 5
+    factors = find_factors_shor(N, a, counts, top_n)
+    if factors is None:
+       #print(f"❌ A = {a} fail")
+       count_no += 1
+       continue
+    else: 
+       if PRINTED:    
+          print(f"✅ A = {a} Factors: {factors}")
+          PRINTED = 0
+       if SWEEP:
+          count_yes += 1
+          continue
+       else:
+          exit(0)
+
+print(f"Valid A: {count_yes} / {count_no+count_yes}")
